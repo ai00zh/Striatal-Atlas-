@@ -1,0 +1,433 @@
+install.packages("harmony", repos = "https://cloud.r-project.org")
+library(harmony)
+file.exists("~/data/combined5_harmony.rds")
+file.exists("~/data/GSM4871780/results/hStrS_d80-83_seurat.rds")
+list.files("~/data/GSM4871780")
+suppressPackageStartupMessages({
+  library(Seurat); library(harmony); library(ggplot2); library(patchwork)
+})
+system("mdfind -name combined5_harmony.rds")
+system("mdfind -name GSM4871780")
+## ================= 1. 読み込み =================
+out_dir   <- "~/data/merged_combined5_hStrS"
+merged    <- readRDS(file.path(out_dir, "merged_combined5_hStrS_harmony.rds"))
+astro_dir <- file.path(out_dir, "astrocyte")
+dir.create(astro_dir, showWarnings = FALSE)
+
+astro_markers <- intersect(c("GFAP", "AQP4", "SLC1A3", "S100B", "ALDH1L1",
+                             "HEPACAM", "SPARCL1", "AGT", "FABP7"), rownames(merged))
+
+## ================= 2. 統合UMAP + アストロのフィーチャー =================
+if (!"Astro_score1" %in% colnames(merged@meta.data))
+  merged <- AddModuleScore(merged, features = list(astro_markers), name = "Astro_score")
+
+pA <- (DimPlot(merged, label = TRUE, repel = TRUE) + ggtitle("Merged clusters")) |
+  (DimPlot(merged, group.by = "dataset", shuffle = TRUE) + ggtitle("Dataset")) |
+  (FeaturePlot(merged, "Astro_score1", order = TRUE) +
+     scale_colour_viridis_c(option = "magma") + ggtitle("Astrocyte score"))
+ggsave(file.path(astro_dir, "A1_merged_UMAP_astro_score.png"), pA, width = 20, height = 6, dpi = 150)
+
+pB <- FeaturePlot(merged, features = astro_markers, ncol = 3, order = TRUE,
+                  cols = c("lightgrey", "firebrick"))
+ggsave(file.path(astro_dir, "A2_merged_FeaturePlot_astro.png"), pB,
+       width = 13, height = 4 * ceiling(length(astro_markers) / 3), dpi = 150)
+
+pC <- DotPlot(merged, features = astro_markers) + RotatedAxis()
+ggsave(file.path(astro_dir, "A3_merged_DotPlot_astro.png"), pC, width = 8, height = 7, dpi = 150)
+print(pA); print(pC)
+
+## ================= 3. アストロサイトの抽出 =================
+# A3のDotPlotを見て、アストロサイトのクラスタ番号を手で指定するのが確実
+# NULLのままなら、モジュールスコア平均が閾値を超えるクラスタを自動選択
+ASTRO_CLUSTERS <- NULL          # 例: c("3", "7")
+SCORE_CUTOFF   <- 0.3
+
+score_by_cl <- sort(tapply(mergedAstroscore1,mergedseurat_clusters, mean), decreasing = TRUE)
+print(round(score_by_cl, 3))
+if (is.null(ASTRO_CLUSTERS)) ASTRO_CLUSTERS <- names(score_by_cl)[score_by_cl > SCORE_CUTOFF]
+cat("Astrocyte clusters:", paste(ASTRO_CLUSTERS, collapse = ", "), "\n")
+
+astro <- subset(merged, subset = seurat_clusters %in% ASTRO_CLUSTERS)
+cat("Astrocytes:", ncol(astro), "cells\n"); print(table(astro$dataset))
+
+## ================= 4. アストロサイトだけで再解析 → UMAP =================
+astromergedclusters<-astroseurat_clusters
+print(table(astro$batch))   # 細胞数が極端に少ないバッチがないか確認
+
+astro <- FindVariableFeatures(astro, nfeatures = 2000)
+astro <- ScaleData(astro)
+astro <- RunPCA(astro, npcs = 30, verbose = FALSE)
+astro <- RunHarmony(astro, group.by.vars = "batch")
+adims <- 1:20
+astro <- FindNeighbors(astro, reduction = "harmony", dims = adims)
+astro <- FindClusters(astro, resolution = 0.4)
+astro <- RunUMAP(astro, reduction = "harmony", dims = adims)
+
+p1 <- (DimPlot(astro, label = TRUE) + ggtitle("Astrocyte subclusters")) |
+  (DimPlot(astro, group.by = "dataset", shuffle = TRUE) + ggtitle("Dataset"))
+ggsave(file.path(astro_dir, "B1_astro_UMAP.png"), p1, width = 14, height = 6, dpi = 150)
+
+p2 <- DimPlot(astro, split.by = "dataset", label = TRUE) + NoLegend()
+ggsave(file.path(astro_dir, "B2_astro_UMAP_split.png"), p2, width = 13, height = 6, dpi = 150)
+
+## ================= 5. アストロサイト内でのフィーチャー =================
+# 成熟マーカーと前駆細胞（放射状グリア）マーカーで成熟度を比較
+feat_sets <- list(
+  Mature     = c("GFAP", "AQP4", "ALDH1L1", "S100B", "SPARCL1", "AGT"),
+  Progenitor = c("FABP7", "VIM", "SOX2", "PAX6", "HES1", "MKI67")
+)
+feat_sets <- lapply(feat_sets, intersect, rownames(astro))
+
+p3 <- FeaturePlot(astro, features = unlist(feat_sets), ncol = 4, order = TRUE,
+                  cols = c("lightgrey", "firebrick"))
+ggsave(file.path(astro_dir, "B3_astro_FeaturePlot.png"), p3,
+       width = 16, height = 4 * ceiling(length(unlist(feat_sets)) / 4), dpi = 150)
+
+astro <- AddModuleScore(astro, features = feat_sets, name = c("Mature", "Progenitor"))
+# AddModuleScoreは末尾に番号が付く → Mature1, Progenitor2
+p4 <- FeaturePlot(astro, features = c("Mature1", "Progenitor2"), order = TRUE, ncol = 2) &
+  scale_colour_viridis_c(option = "magma")
+p5 <- VlnPlot(astro, features = c("Mature1", "Progenitor2"), group.by = "dataset", pt.size = 0)
+ggsave(file.path(astro_dir, "B4_astro_maturity_scores.png"), p4 / p5, width = 11, height = 10, dpi = 150)
+
+p6 <- FeaturePlot(astro, features = c("GFAP", "AQP4"), split.by = "dataset",
+                  order = TRUE, cols = c("lightgrey", "firebrick"))
+ggsave(file.path(astro_dir, "B5_astro_GFAP_AQP4_split.png"), p6, width = 10, height = 8, dpi = 150)
+
+p7 <- DotPlot(astro, features = unique(unlist(feat_sets)), group.by = "dataset") + RotatedAxis()
+ggsave(file.path(astro_dir, "B6_astro_DotPlot_by_dataset.png"), p7, width = 9, height = 4, dpi = 150)
+
+## ================= 6. マーカー遺伝子 =================
+# サブクラスタごとのマーカー
+Idents(astro) <- "seurat_clusters"
+sub_markers <- FindAllMarkers(astro, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(sub_markers, file.path(astro_dir, "astro_subcluster_markers.csv"), row.names = FALSE)
+
+top5 <- do.call(rbind, lapply(split(sub_markers, sub_markers$cluster),
+                              function(d) head(d[order(-d$avg_log2FC), ], 5)))
+p8 <- DotPlot(astro, features = unique(top5$gene)) + RotatedAxis()
+ggsave(file.path(astro_dir, "B7_astro_subcluster_top5.png"), p8,
+       width = max(8, length(unique(top5$gene)) * 0.35), height = 5, dpi = 150)
+
+# hStrS と combined5 のアストロサイト間の発現差
+de_ds <- FindMarkers(astro, ident.1 = "hStrS_d80-83", ident.2 = "combined5",
+                     group.by = "dataset", min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(de_ds, file.path(astro_dir, "astro_DE_hStrS_vs_combined5.csv"))
+cat("Top DE genes (hStrS vs combined5):\n"); print(head(de_ds[order(de_ds$p_val_adj), ], 20))
+
+## ================= 7. 保存・表示 =================
+saveRDS(astro, file.path(astro_dir, "astrocytes_reclustered.rds"))
+print(p1); print(p3); print(p4 / p5)
+cat("Done ->", astro_dir, "\n")
+
+
+
+install.packages(c("SeuratObject", "Seurat"), repos = "https://cloud.r-project.org")
+
+
+suppressPackageStartupMessages({
+  library(Seurat); library(harmony); library(ggplot2); library(patchwork)
+})
+
+## ================= 1. パス設定 =================
+combined_rds <- "/Users/okanolab/Downloads/combined5_harmony.rds"
+mtx_file     <- "/Users/okanolab/Downloads/GSM4871780_hStrS_d80-83_aggr_matrix.mtx.gz"
+feat_file    <- "/Users/okanolab/Downloads/GSM4871780_hStrS_d80-83_aggr_features.tsv.gz"
+bc_file      <- "/Users/okanolab/Downloads/GSM4871780_hStrS_d80-83_aggr_barcodes.tsv.gz"
+out_dir      <- "/Users/okanolab/Desktop/merged_combined5_hStrS"
+OLD_BATCH_COL <- NULL   # combined5側のサンプル列名。NULLなら自動推定
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+stopifnot(file.exists(combined_rds, mtx_file, feat_file, bc_file))
+
+## ================= 2. 共通関数 =================
+get_counts <- function(obj) {
+  obj <- UpdateSeuratObject(obj)
+  if (!"RNA" %in% Assays(obj)) stop("RNA assay がありません: ", paste(Assays(obj), collapse = ", "))
+  DefaultAssay(obj) <- "RNA"
+  if (inherits(obj[["RNA"]], "Assay5")) obj <- JoinLayers(obj, assay = "RNA")
+  m <- LayerData(obj, assay = "RNA", layer = "counts")
+  if (nrow(m) == 0 || ncol(m) == 0) stop("RNA counts が空です（dataしか無いオブジェクト）")
+  if (any(m@x %% 1 != 0)) warning("counts に非整数値があります。正規化済みの値かもしれません")
+  m
+}
+clean_meta <- function(md) {
+  if ("seurat_clusters" %in% colnames(md)) mdoldclusters<-mdseurat_clusters
+  md[, !grepl("^nCount_|^nFeature_|^seurat_clusters$|_snn_res\\.", colnames(md)), drop = FALSE]
+}
+
+## ================= 3. combined5 の読み込み =================
+old <- readRDS(combined_rds)
+print(old)
+cat("meta.data の列:", paste(colnames(old@meta.data), collapse = ", "), "\n")
+old_counts <- get_counts(old)
+old_meta   <- clean_meta(old@meta.data)
+if (is.null(OLD_BATCH_COL)) {
+  cand <- intersect(c("sample", "Sample", "sample_id", "batch", "orig.ident"), colnames(old_meta))
+  OLD_BATCH_COL <- if (length(cand)) cand[1] else NA
+}
+cat("combined5 のバッチ列:", OLD_BATCH_COL, "\n")
+rm(old); gc()
+
+## ================= 4. hStrS の読み込み + QC =================
+new_counts <- ReadMtx(mtx = mtx_file, features = feat_file, cells = bc_file, feature.column = 2)
+tmp <- CreateSeuratObject(new_counts, min.cells = 3, min.features = 200)
+tmp[["percent.mt"]] <- PercentageFeatureSet(tmp, pattern = "^MT-")
+tmp <- subset(tmp, subset = nFeature_RNA > 500 & nFeature_RNA < 7000 & percent.mt < 15)
+new_counts <- LayerData(tmp, layer = "counts")
+new_meta <- data.frame(row.names = colnames(tmp))
+new_meta$library <- paste0("lib", sub(".*-", "", rownames(new_meta)))
+cat("hStrS cells after QC:", ncol(tmp), "\n")
+rm(tmp); gc()
+
+## ================= 5. 共通遺伝子 =================
+common <- intersect(rownames(old_counts), rownames(new_counts))
+cat("共通遺伝子:", length(common), "/ combined5:", nrow(old_counts), "/ hStrS:", nrow(new_counts), "\n")
+if (length(common) < 10000)
+  warning("共通遺伝子が少ないです。生物種や遺伝子名の形式（シンボル/Ensembl）を確認してください")
+
+## ================= 6. merge =================
+old_obj <- CreateSeuratObject(old_counts[common, ], meta.data = old_meta)
+new_obj <- CreateSeuratObject(new_counts[common, ], meta.data = new_meta)
+rm(old_counts, new_counts); gc()
+
+old_obj$dataset <- "combined5"
+old_obj$batch   <- if (is.na(OLD_BATCH_COL)) "combined5" else paste0("c5_", old_obj@meta.data[[OLD_BATCH_COL]])
+new_obj$dataset <- "hStrS_d80-83"
+new_objbatch <-paste0("hStrS",newobjlibrary)
+
+merged <- merge(old_obj, new_obj, add.cell.ids = c("c5", "hStrS"))
+merged <- JoinLayers(merged)
+rm(old_obj, new_obj); gc()
+merged[["percent.mt"]] <- PercentageFeatureSet(merged, pattern = "^MT-")
+print(table(merged$batch))
+
+## ================= 7. 正規化 → PCA → Harmony → UMAP =================
+merged <- NormalizeData(merged)
+merged <- FindVariableFeatures(merged, nfeatures = 2000)
+merged <- ScaleData(merged)
+merged <- RunPCA(merged, npcs = 50, verbose = FALSE)
+merged <- RunHarmony(merged, group.by.vars = "batch")
+ndims <- 1:30
+merged <- FindNeighbors(merged, reduction = "harmony", dims = ndims)
+merged <- FindClusters(merged, resolution = 0.5)
+merged <- RunUMAP(merged, reduction = "harmony", dims = ndims)
+
+p1 <- (DimPlot(merged, label = TRUE, repel = TRUE) + ggtitle("Clusters (merged)")) |
+  (DimPlot(merged, group.by = "dataset", shuffle = TRUE) + ggtitle("Dataset"))
+ggsave(file.path(out_dir, "01_UMAP_clusters_dataset.png"), p1, width = 14, height = 6, dpi = 150)
+p2 <- DimPlot(merged, group.by = "batch", shuffle = TRUE) + ggtitle("Batch")
+ggsave(file.path(out_dir, "02_UMAP_batch.png"), p2, width = 9, height = 6, dpi = 150)
+p3 <- DimPlot(merged, split.by = "dataset", label = TRUE) + NoLegend()
+ggsave(file.path(out_dir, "03_UMAP_split_dataset.png"), p3, width = 13, height = 6, dpi = 150)
+if ("old_clusters" %in% colnames(merged@meta.data)) {
+  p4 <- DimPlot(merged, group.by = "old_clusters", label = TRUE, repel = TRUE, na.value = "grey90") +
+    ggtitle("combined5 original clusters")
+  ggsave(file.path(out_dir, "04_UMAP_old_clusters.png"), p4, width = 9, height = 6, dpi = 150)
+}
+
+## ================= 8. アストロサイト =================
+astro_markers <- intersect(c("GFAP", "AQP4", "SLC1A3", "S100B", "ALDH1L1",
+                             "HEPACAM", "SPARCL1", "AGT", "FABP7"), rownames(merged))
+p5 <- FeaturePlot(merged, features = astro_markers, ncol = 3, order = TRUE,
+                  cols = c("lightgrey", "firebrick"))
+ggsave(file.path(out_dir, "05_FeaturePlot_astro.png"), p5,
+       width = 13, height = 4 * ceiling(length(astro_markers) / 3), dpi = 150)
+merged <- AddModuleScore(merged, features = list(astro_markers), name = "Astro_score")
+p6 <- DotPlot(merged, features = astro_markers) + RotatedAxis()
+ggsave(file.path(out_dir, "06_DotPlot_astro.png"), p6, width = 8, height = 7, dpi = 150)
+
+
+print(p1)   # 統合UMAP（クラスタ / データセット）
+print(p2)   # バッチ別
+print(p3)   # データセット別に左右分割
+print(p4)   # combined5の元のクラスタ
+print(p5)   # アストロサイトマーカーのFeaturePlot
+print(p6)   # アストロサイトマーカーのDotPlot
+
+
+
+suppressPackageStartupMessages({ library(Seurat); library(harmony); library(ggplot2); library(patchwork) })
+
+out_dir <- "/Users/okanolab/Desktop/merged_combined5_hStrS"
+if (!exists("merged")) merged <- readRDS(file.path(out_dir, "merged_combined5_hStrS_harmony.rds"))
+astro_dir <- file.path(out_dir, "astrocyte"); dir.create(astro_dir, showWarnings = FALSE)
+
+astro_markers <- intersect(c("GFAP", "AQP4", "SLC1A3", "S100B", "ALDH1L1",
+                             "HEPACAM", "SPARCL1", "AGT", "FABP7"), rownames(merged))
+if (!"Astro_score1" %in% colnames(merged@meta.data))
+  merged <- AddModuleScore(merged, features = list(astro_markers), name = "Astro_score")
+
+## ================= 1. アストロサイトクラスタの選択 =================
+# 確実にするなら DotPlot（p6）を見て番号を手で指定 例: c("3", "7")
+ASTRO_CLUSTERS <- NULL
+SCORE_CUTOFF   <- 0.3
+
+score_by_cl <- sort(tapply(mergedAstroscore1,mergedseurat_clusters, mean), decreasing = TRUE)
+print(round(score_by_cl, 3))
+if (is.null(ASTRO_CLUSTERS)) ASTRO_CLUSTERS <- names(score_by_cl)[score_by_cl > SCORE_CUTOFF]
+cat("Astrocyte clusters:", paste(ASTRO_CLUSTERS, collapse = ", "), "\n")
+
+# 選んだクラスタを統合UMAP上で確認
+mergedastroflag<-ifelse(mergedseurat_clusters %in% ASTRO_CLUSTERS, "Astrocyte", "Other")
+pSel <- DimPlot(merged, group.by = "astro_flag", split.by = "dataset", order = "Astrocyte",
+                cols = c(Astrocyte = "firebrick", Other = "grey88")) + ggtitle("Selected astrocytes")
+ggsave(file.path(astro_dir, "D0_selected_astrocytes.png"), pSel, width = 13, height = 6, dpi = 150)
+print(pSel)
+
+astro <- subset(merged, subset = astro_flag == "Astrocyte")
+cat("Astrocytes:", ncol(astro), "cells\n"); print(table(astro$dataset))
+print(prop.table(table(mergeddataset,mergedastro_flag), 1) * 100)   # 各データセットのアストロ割合(%)
+
+## ================= 2. アストロサイトだけで再解析 → UMAP =================
+astromergedclusters<-astroseurat_clusters
+bt <- table(astro$batch); print(bt)
+# 細胞数が少ないバッチがあると Harmony が不安定なので、その場合は dataset 単位で補正
+harmony_var <- if (min(bt) >= 30) "batch" else "dataset"
+cat("Harmony group.by.vars:", harmony_var, "\n")
+
+astro <- FindVariableFeatures(astro, nfeatures = 2000)
+astro <- ScaleData(astro)
+astro <- RunPCA(astro, npcs = 30, verbose = FALSE)
+astro <- RunHarmony(astro, group.by.vars = harmony_var)
+adims <- 1:20
+astro <- FindNeighbors(astro, reduction = "harmony", dims = adims)
+astro <- FindClusters(astro, resolution = 0.4)
+astro <- RunUMAP(astro, reduction = "harmony", dims = adims)
+
+p1 <- (DimPlot(astro, label = TRUE) + ggtitle("Astrocyte subclusters")) |
+  (DimPlot(astro, group.by = "dataset", shuffle = TRUE) + ggtitle("Dataset"))
+p2 <- DimPlot(astro, split.by = "dataset", label = TRUE) + NoLegend()
+ggsave(file.path(astro_dir, "D1_astro_UMAP.png"), p1, width = 14, height = 6, dpi = 150)
+ggsave(file.path(astro_dir, "D2_astro_UMAP_split.png"), p2, width = 13, height = 6, dpi = 150)
+print(p1); print(p2)
+
+## ================= 3. アストロサイト内の発現比較 UMAP =================
+feat_sets <- list(
+  Mature     = c("GFAP", "AQP4", "ALDH1L1", "S100B", "SPARCL1", "AGT"),
+  Progenitor = c("FABP7", "VIM", "SOX2", "PAX6", "HES1", "MKI67")
+)
+feat_sets <- lapply(feat_sets, intersect, rownames(astro))
+
+p3 <- FeaturePlot(astro, features = c("GFAP", "AQP4", "SLC1A3", "FABP7"), split.by = "dataset",
+                  order = TRUE, keep.scale = "feature", cols = c("lightgrey", "firebrick"))
+ggsave(file.path(astro_dir, "D3_astro_markers_split.png"), p3, width = 10, height = 14, dpi = 150)
+print(p3)
+
+astro <- AddModuleScore(astro, features = feat_sets, name = c("Mature", "Progenitor"))
+p4 <- FeaturePlot(astro, features = c("Mature1", "Progenitor2"), split.by = "dataset",
+                  order = TRUE, keep.scale = "feature") &
+  scale_colour_viridis_c(option = "magma")
+p5 <- VlnPlot(astro, features = c("Mature1", "Progenitor2"), group.by = "dataset", pt.size = 0)
+ggsave(file.path(astro_dir, "D4_maturity_scores.png"), p4 / p5, width = 11, height = 13, dpi = 150)
+print(p4 / p5)
+
+p6 <- DotPlot(astro, features = unique(unlist(feat_sets)), group.by = "dataset") + RotatedAxis()
+ggsave(file.path(astro_dir, "D5_DotPlot_by_dataset.png"), p6, width = 9, height = 3.5, dpi = 150)
+print(p6)
+
+## ================= 4. hStrS vs combined5 のDE解析 =================
+Idents(astro) <- "dataset"
+de <- FindMarkers(astro, ident.1 = "hStrS_d80-83", ident.2 = "combined5",
+                  min.pct = 0.1, logfc.threshold = 0.25)
+de$gene <- rownames(de)
+write.csv(de, file.path(astro_dir, "astro_DE_hStrS_vs_combined5.csv"), row.names = FALSE)
+
+# Volcano plot
+desig<-ifelse(dep_val_adj < 0.05 & abs(de$avg_log2FC) > 0.5,
+                 ifelse(de$avg_log2FC > 0, "Up in hStrS", "Up in combined5"), "NS")
+lab <- rbind(head(de[desig=="UpinhStrS",][order(-deavg_log2FC[de$sig == "Up in hStrS"]), ], 15),
+             head(de[desig=="Upincombined5",][order(deavg_log2FC[de$sig == "Up in combined5"]), ], 15))
+pVol <- ggplot(de, aes(avg_log2FC, -log10(p_val_adj + 1e-300), colour = sig)) +
+  geom_point(size = 0.8) +
+  geom_text(data = lab, aes(label = gene), size = 3, vjust = -0.6, show.legend = FALSE) +
+  scale_colour_manual(values = c("Up in hStrS" = "firebrick", "Up in combined5" = "royalblue", NS = "grey75")) +
+  labs(x = "log2FC (hStrS / combined5)", y = "-log10 adj. p", title = "Astrocytes: hStrS vs combined5") +
+  theme_classic()
+ggsave(file.path(astro_dir, "D6_volcano_hStrS_vs_combined5.png"), pVol, width = 9, height = 7, dpi = 150)
+print(pVol)
+
+# 上位DE遺伝子をUMAP上で比較
+top_genes <- c(head(labgene[labsig == "Up in hStrS"], 3), head(labgene[labsig == "Up in combined5"], 3))
+if (length(top_genes)) {
+  p7 <- FeaturePlot(astro, features = top_genes, split.by = "dataset", order = TRUE,
+                    keep.scale = "feature", cols = c("lightgrey", "firebrick"))
+  ggsave(file.path(astro_dir, "D7_topDE_split.png"), p7, width = 10, height = 3.5 * length(top_genes), dpi = 150)
+  print(p7)
+}
+
+## ================= 5. サブクラスタのマーカー・構成比 =================
+Idents(astro) <- "seurat_clusters"
+sub_markers <- FindAllMarkers(astro, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(sub_markers, file.path(astro_dir, "astro_subcluster_markers.csv"), row.names = FALSE)
+
+comp <- as.data.frame(prop.table(table(astrodataset,astroseurat_clusters), 1))
+colnames(comp) <- c("dataset", "subcluster", "fraction")
+pBar <- ggplot(comp, aes(dataset, fraction, fill = subcluster)) +
+  geom_col() + labs(y = "Fraction of astrocytes", title = "Subcluster composition") + theme_classic()
+ggsave(file.path(astro_dir, "D8_subcluster_composition.png"), pBar, width = 5, height = 6, dpi = 150)
+print(pBar)
+
+## ================= 6. 保存 =================
+saveRDS(astro, file.path(astro_dir, "astrocytes_reclustered.rds"))
+cat("Done ->", astro_dir, "\n")
+
+
+suppressPackageStartupMessages({ library(Seurat); library(ggplot2); library(patchwork) })
+
+out_dir   <- "/Users/okanolab/Desktop/merged_combined5_hStrS"
+astro_dir <- file.path(out_dir, "astrocyte")
+dir.create(astro_dir, showWarnings = FALSE)
+
+## ---- 読み込み（セッションに残っていればそれを使う） ----
+if (!exists("astro")) astro <- readRDS(file.path(astro_dir, "astrocytes_reclustered.rds"))
+if (!exists("merged")) merged <- readRDS(file.path(out_dir, "merged_combined5_hStrS_harmony.rds"))
+merged$astro_flag <- ifelse(colnames(merged) %in% colnames(astro), "Astrocyte", "Other")
+
+## ---- 表示名と色 ----
+src_lab <- c("hStrS_d80-83" = "Miura et al. (hStrS d80-83)",
+             "combined5"    = "combined5 (harmony)")
+src_col <- c("Miura et al. (hStrS d80-83)" = "#D7301F",
+             "combined5 (harmony)"         = "#2171B5")
+
+astrosource<-factor(unname(srclab[as.character(astrodataset)]), levels = unname(src_lab))
+mergedsourceastro<-unname(ifelse(mergedastro_flag == "Astrocyte",
+                                     src_lab[as.character(merged$dataset)], "Other cells"))
+print(table(astro$source))
+print(table(merged$source_astro))
+
+## ---- 1. アストロサイトだけのUMAP（色分け） ----
+n_src <- table(astro$source)
+small_first <- names(sort(n_src))               # 少ない方を手前（上）に描く
+pA <- DimPlot(astro, group.by = "source", order = small_first,
+              cols = src_col, pt.size = 0.3) +
+  ggtitle("Astrocytes: Miura et al. vs combined5") +
+  theme(legend.position = "bottom")
+
+pB <- DimPlot(astro, group.by = "source", split.by = "source",
+              cols = src_col, pt.size = 0.3) + NoLegend()
+
+ggsave(file.path(astro_dir, "E1_astro_UMAP_by_source.png"), pA, width = 7.5, height = 7.5, dpi = 200)
+ggsave(file.path(astro_dir, "E2_astro_UMAP_by_source_split.png"), pB, width = 13, height = 6.5, dpi = 200)
+print(pA); print(pB)
+
+## ---- 2. 統合UMAP全体の中でアストロサイトを色分け ----
+cols_all <- c(src_col, "Other cells" = "grey90")
+pC <- DimPlot(merged, group.by = "source_astro", cols = cols_all,
+              order = small_first, pt.size = 0.1) +
+  ggtitle("Astrocytes in the merged UMAP") +
+  theme(legend.position = "bottom")
+ggsave(file.path(astro_dir, "E3_merged_UMAP_astro_by_source.png"), pC, width = 8, height = 8, dpi = 200)
+print(pC)
+
+## ---- 3. 細胞数をそろえた版 ----
+set.seed(1)
+n_min <- min(n_src)
+cells_eq <- unlist(lapply(split(colnames(astro), astro$source), sample, size = n_min))
+pD <- DimPlot(astro, cells = cells_eq, group.by = "source", cols = src_col,
+              shuffle = TRUE, pt.size = 0.4) +
+  ggtitle(sprintf("Downsampled: %d cells each", n_min)) +
+  theme(legend.position = "bottom")
+ggsave(file.path(astro_dir, "E4_astro_UMAP_by_source_downsampled.png"), pD, width = 7.5, height = 7.5, dpi = 200)
+print(pD)
+
+
